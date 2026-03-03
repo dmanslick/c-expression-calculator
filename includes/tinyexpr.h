@@ -111,6 +111,8 @@ void te_free(te_expr *n);
 /* Parses, evaluates, and frees an expression with scalar/vector bindings. */
 te_value te_interp_value(const char *expression, const te_binding *bindings, int bind_count, int *error);
 
+int set_var(char var, te_value expr);
+te_value get_var(char var);
 
 #ifdef __cplusplus
 }

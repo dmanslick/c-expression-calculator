@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Zlib
+// SPDX-License-Identifier: Zlib
 /*
  * TINYEXPR - Tiny recursive descent parser and evaluation engine in C
  *
@@ -175,6 +175,9 @@ static double oproj(double a, double b);
 static double proj(double a, double b);
 static double cross(double a, double b);
 static double unit(double a);
+static te_value make_error(void);
+static te_value expressions[26];
+static int expression_is_set[26];
 
 #ifdef _MSC_VER
 #pragma function (ceil)
@@ -316,12 +319,24 @@ void next_token(state *s) {
 
                 const te_variable *var = find_lookup(s, start, len);
                 const te_binding *vvar = find_value_lookup(s, start, len);
+                const te_value *stored_value = 0;
                 if (!var) var = find_builtin(start, s->next - start);
+
+                if (!vvar && len == 1 && start[0] >= 'A' && start[0] <= 'Z') {
+                    int stored_index = start[0] - 'A';
+                    if (expression_is_set[stored_index]) {
+                        stored_value = &expressions[stored_index];
+                    }
+                }
 
                 if (vvar) {
                     s->type = TOK_VARIABLE;
                     s->var_is_value = 1;
                     s->value_bound = &vvar->value;
+                } else if (stored_value) {
+                    s->type = TOK_VARIABLE;
+                    s->var_is_value = 1;
+                    s->value_bound = stored_value;
                 } else if (!var) {
                     s->type = TOK_ERROR;
                 } else {
@@ -652,10 +667,8 @@ static te_expr *factor(state *s) {
 }
 #endif
 
-
-
 static te_expr *term(state *s) {
-    /* <term>      =    <factor> {("*" | "/" | "%" | "â€¢" | "Ã—") <factor>} */
+    /* <term>      =    <factor> {("*" | "/" | "%") <factor>} */
     te_expr *ret = factor(s);
     CHECK_NULL(ret);
 
@@ -832,8 +845,30 @@ te_value te_eval_value(const te_expr *n) {
                 );
             }
 
-            if (n->function == add || n->function == sub ||
-                n->function == fmod || n->function == pow) {
+            if (n->function == add || n->function == sub) {
+                if (ARITY(n->type) != 2) return make_error();
+                if (args[0].kind == TE_VAL_SCALAR && args[1].kind == TE_VAL_SCALAR) {
+                    if (n->function == add) return make_scalar(args[0].scalar + args[1].scalar);
+                    return make_scalar(args[0].scalar - args[1].scalar);
+                }
+                if (args[0].kind == TE_VAL_VEC3 && args[1].kind == TE_VAL_VEC3) {
+                    if (n->function == add) {
+                        return make_vec3(
+                            args[0].vec3.x + args[1].vec3.x,
+                            args[0].vec3.y + args[1].vec3.y,
+                            args[0].vec3.z + args[1].vec3.z
+                        );
+                    }
+                    return make_vec3(
+                        args[0].vec3.x - args[1].vec3.x,
+                        args[0].vec3.y - args[1].vec3.y,
+                        args[0].vec3.z - args[1].vec3.z
+                    );
+                }
+                return make_error();
+            }
+
+            if (n->function == fmod || n->function == pow) {
                 double a;
                 double b;
                 if (ARITY(n->type) != 2 || args[0].kind != TE_VAL_SCALAR || args[1].kind != TE_VAL_SCALAR) {
@@ -841,8 +876,6 @@ te_value te_eval_value(const te_expr *n) {
                 }
                 a = args[0].scalar;
                 b = args[1].scalar;
-                if (n->function == add) return make_scalar(a + b);
-                if (n->function == sub) return make_scalar(a - b);
                 if (n->function == fmod) return make_scalar(fmod(a, b));
                 return make_scalar(pow(a, b));
             }
@@ -1015,6 +1048,28 @@ static void optimize(te_expr *n) {
     }
 }
 
+int set_var(char var, te_value expr) {
+    if (var < 'A' || var > 'Z') {
+        return -1;
+    }
+
+    int index = var - 'A';
+    expressions[index] = expr;
+    expression_is_set[index] = 1;
+    return 0;
+}
+
+te_value get_var(char var) {
+    if (var < 'A' || var > 'Z') {
+        return make_error();
+    }
+    
+    int index = var - 'A';
+    if (!expression_is_set[index]) {
+        return make_error();
+    }
+    return expressions[index]; 
+} 
 
 te_expr *te_compile(const char *expression, const te_variable *variables, int var_count, int *error) {
     state s;
@@ -1096,13 +1151,42 @@ double te_interp(const char *expression, int *error) {
 }
 
 te_value te_interp_value(const char *expression, const te_binding *bindings, int bind_count, int *error) {
-    te_expr *n = te_compile_value(expression, bindings, bind_count, error);
     te_value ret = make_error();
+    te_expr* n = 0;
+    int store_expr = 0;
+    char variable;
+
+    if (strncmp(expression, "STORE", 5) == 0) {
+        store_expr = 1;
+        int actual_expr_len;
+
+        if (expression[5] != '(' || expression[7] != ')' || expression[8] != ':') {
+            return make_error();
+        }
+        if (expression[6] < 'A' || expression[6] > 'Z') {
+            return make_error();
+        }
+
+        actual_expr_len = (int)strlen(expression) - 9;
+
+        if (actual_expr_len <= 0) {
+            return make_error();
+        }
+        
+        variable = expression[6];
+        n = te_compile_value(expression + 9, bindings, bind_count, error); /* STORE(A):... */
+    } else {
+        n = te_compile_value(expression, bindings, bind_count, error);
+    }
 
     if (n) {
         ret = te_eval_value(n);
+        if (store_expr) {
+            set_var(variable, ret);
+        }
         te_free(n);
     }
+
     return ret;
 }
 
@@ -1136,5 +1220,6 @@ static void pn (const te_expr *n, int depth) {
 void te_print(const te_expr *n) {
     pn(n, 0);
 }
+
 
 
