@@ -10,6 +10,7 @@ int main(void) {
     puts("Type an expression and press Enter.");
     puts("Vector examples: <1,2,3>, 2*<1,2,3>, |<1,2,3>|, dot(<1,0,0>,<0,1,0>), cross(<1,0,0>,<0,1,0>)");
     puts("Projection order is function(B,A): proj(B,A), oproj(B,A), comp(B,A), ocomp(B,A)");
+    puts("Unit vector: unit(<3,4,0>)");
     puts("Type 'exit' or 'quit' to end.");
 
     while (1) {

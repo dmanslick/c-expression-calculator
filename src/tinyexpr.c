@@ -174,6 +174,7 @@ static double ocomp(double a, double b);
 static double oproj(double a, double b);
 static double proj(double a, double b);
 static double cross(double a, double b);
+static double unit(double a);
 
 #ifdef _MSC_VER
 #pragma function (ceil)
@@ -218,6 +219,7 @@ static const te_variable functions[] = {
     {"sqrt", sqrt,    TE_FUNCTION1 | TE_FLAG_PURE, 0},
     {"tan", tan,      TE_FUNCTION1 | TE_FLAG_PURE, 0},
     {"tanh", tanh,    TE_FUNCTION1 | TE_FLAG_PURE, 0},
+    {"unit", unit,    TE_FUNCTION1 | TE_FLAG_PURE, 0},
     {0, 0, 0, 0}
 };
 
@@ -280,6 +282,7 @@ static double ocomp(double a, double b) {(void)a; (void)b; return NAN;}
 static double oproj(double a, double b) {(void)a; (void)b; return NAN;}
 static double proj(double a, double b) {(void)a; (void)b; return NAN;}
 static double cross(double a, double b) {(void)a; (void)b; return NAN;}
+static double unit(double a) {(void)a; return NAN;}
 static double vec3_literal(double a, double b, double c) {(void)a; (void)b; (void)c; return NAN;}
 static double magnitude(double a) {(void)a; return NAN;}
 static double negate(double a) {return -a;}
@@ -811,6 +814,22 @@ te_value te_eval_value(const te_expr *n) {
                     ));
                 }
                 return make_error();
+            }
+
+            if (n->function == unit) {
+                double len;
+                if (ARITY(n->type) != 1 || args[0].kind != TE_VAL_VEC3) return make_error();
+                len = sqrt(
+                    args[0].vec3.x * args[0].vec3.x +
+                    args[0].vec3.y * args[0].vec3.y +
+                    args[0].vec3.z * args[0].vec3.z
+                );
+                if (len == 0.0) return make_error();
+                return make_vec3(
+                    args[0].vec3.x / len,
+                    args[0].vec3.y / len,
+                    args[0].vec3.z / len
+                );
             }
 
             if (n->function == add || n->function == sub ||
