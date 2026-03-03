@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "tinyexpr.h"
+#include "common.h"
 
 double evaluate_expression(char* expression_text, double a, int* error_ptr) {
     double x = a;

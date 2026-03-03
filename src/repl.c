@@ -1,20 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "tinyexpr.h"
-
-static void print_value(te_value value) {
-    switch (value.kind) {
-        case TE_VAL_VEC3:
-            printf("<%.6f, %.6f, %.6f>\n", value.vec3.x, value.vec3.y, value.vec3.z);
-            break;
-        case TE_VAL_SCALAR:
-            printf("%.6f\n", value.scalar);
-            break;
-        default:
-            printf("error\n");
-            break;
-    }
-}
+#include "common.h"
 
 int main(void) {
     char input[512];
@@ -48,7 +35,7 @@ int main(void) {
             printf("parse error at character %d\n", error);
             continue;
         }
-        print_value(result);
+        disp(result);
     }
 
     return 0;
