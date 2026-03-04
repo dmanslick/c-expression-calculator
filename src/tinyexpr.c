@@ -175,7 +175,18 @@ static double oproj(double a, double b);
 static double proj(double a, double b);
 static double cross(double a, double b);
 static double unit(double a);
+static double derivative_eval(const te_expr *compiled_expr, te_binding *x_binding, int *error, double at_point);
+static double integral_eval(const te_expr *compiled_expr, te_binding *x_binding, int *error, double lower, double upper);
+static int eval_compiled_scalar_at_x(const te_expr *compiled_expr, te_binding *x_binding, double x, double *out);
+static int evaluate_scalar_text(const char *text, const te_binding *bindings, int bind_count, double *out, int *error);
+static int parse_calculus_call(const char *expression, int *is_derivative, char **arg0, char **arg1, char **arg2);
+static int split_calculus_args(const char *args_start, const char *args_end, int expected_count, char **arg0, char **arg1, char **arg2);
+static char *copy_trimmed_slice(const char *start, const char *end);
+static void free_calculus_args(char **arg0, char **arg1, char **arg2);
+static int evaluate_calculus_call(const char *expression, const te_binding *bindings, int bind_count, te_value *result, int *error);
+static char *expand_calculus_calls(const char *expression, const te_binding *bindings, int bind_count, int *error);
 static te_value make_error(void);
+static te_value make_scalar(double x);
 static te_value expressions[26];
 static int expression_is_set[26];
 
@@ -388,6 +399,491 @@ void next_token(state *s) {
 static te_expr *list(state *s);
 static te_expr *expr(state *s);
 static te_expr *power(state *s);
+
+static int eval_compiled_scalar_at_x(const te_expr *compiled_expr, te_binding *x_binding, double x, double *out) {
+    te_value value;
+    if (!compiled_expr || !x_binding || !out) return -1;
+    x_binding->value.kind = TE_VAL_SCALAR;
+    x_binding->value.scalar = x;
+    value = te_eval_value(compiled_expr);
+    if (value.kind != TE_VAL_SCALAR) return -1;
+    *out = value.scalar;
+    return 0;
+}
+
+static double derivative_eval(const te_expr *compiled_expr, te_binding *x_binding, int *error, double at_point) {
+    const double h = 1e-5;
+    double y_plus;
+    double y_minus;
+
+    if (eval_compiled_scalar_at_x(compiled_expr, x_binding, at_point + h, &y_plus) != 0 ||
+        eval_compiled_scalar_at_x(compiled_expr, x_binding, at_point - h, &y_minus) != 0) {
+        if (error) *error = 1;
+        return NAN;
+    }
+
+    return (y_plus - y_minus) / (2.0 * h);
+}
+
+static double integral_eval(const te_expr *compiled_expr, te_binding *x_binding, int *error, double lower, double upper) {
+    int i;
+    int n = 10000;
+    double h;
+    double y_lower;
+    double y_upper;
+    double sum;
+
+    if (n % 2) n++;
+    h = (upper - lower) / n;
+
+    if (eval_compiled_scalar_at_x(compiled_expr, x_binding, lower, &y_lower) != 0 ||
+        eval_compiled_scalar_at_x(compiled_expr, x_binding, upper, &y_upper) != 0) {
+        if (error) *error = 1;
+        return NAN;
+    }
+
+    sum = y_lower + y_upper;
+    for (i = 1; i < n; ++i) {
+        double x = lower + i * h;
+        double y;
+        if (eval_compiled_scalar_at_x(compiled_expr, x_binding, x, &y) != 0) {
+            if (error) *error = 1;
+            return NAN;
+        }
+        if (i % 2 == 0) {
+            sum += 2.0 * y;
+        } else {
+            sum += 4.0 * y;
+        }
+    }
+
+    return (h / 3.0) * sum;
+}
+
+static int evaluate_scalar_text(const char *text, const te_binding *bindings, int bind_count, double *out, int *error) {
+    te_expr *compiled;
+    te_value value;
+    int local_error = 0;
+    if (!text || !out) return -1;
+
+    compiled = te_compile_value(text, bindings, bind_count, &local_error);
+    if (!compiled) {
+        if (error) *error = local_error ? local_error : 1;
+        return -1;
+    }
+
+    value = te_eval_value(compiled);
+    te_free(compiled);
+    if (value.kind != TE_VAL_SCALAR) {
+        if (error) *error = 1;
+        return -1;
+    }
+    *out = value.scalar;
+    if (error) *error = 0;
+    return 0;
+}
+
+static char *copy_trimmed_slice(const char *start, const char *end) {
+    char *out;
+    size_t len;
+    const char *left = start;
+    const char *right = end;
+
+    if (!start || !end || end < start) return 0;
+    while (left < right && isspace((unsigned char)*left)) left++;
+    while (right > left && isspace((unsigned char)*(right - 1))) right--;
+
+    len = (size_t)(right - left);
+    out = (char*)malloc(len + 1);
+    if (!out) return 0;
+
+    if (len > 0) memcpy(out, left, len);
+    out[len] = '\0';
+    return out;
+}
+
+static void free_calculus_args(char **arg0, char **arg1, char **arg2) {
+    if (arg0 && *arg0) {
+        free(*arg0);
+        *arg0 = 0;
+    }
+    if (arg1 && *arg1) {
+        free(*arg1);
+        *arg1 = 0;
+    }
+    if (arg2 && *arg2) {
+        free(*arg2);
+        *arg2 = 0;
+    }
+}
+
+static int split_calculus_args(const char *args_start, const char *args_end, int expected_count, char **arg0, char **arg1, char **arg2) {
+    const char *segment_start;
+    const char *p;
+    const char *arg_starts[3];
+    const char *arg_ends[3];
+    int depth_paren = 0;
+    int depth_vec = 0;
+    int count = 0;
+
+    if (!args_start || !args_end || args_end < args_start || expected_count < 2 || expected_count > 3) return -1;
+
+    segment_start = args_start;
+    p = args_start;
+
+    while (p < args_end) {
+        char ch = *p;
+        if (ch == '(') {
+            depth_paren++;
+        } else if (ch == ')') {
+            if (depth_paren <= 0) return -1;
+            depth_paren--;
+        } else if (ch == '<') {
+            depth_vec++;
+        } else if (ch == '>') {
+            if (depth_vec <= 0) return -1;
+            depth_vec--;
+        } else if (ch == ',' && depth_paren == 0 && depth_vec == 0) {
+            if (count >= expected_count - 1) return -1;
+            arg_starts[count] = segment_start;
+            arg_ends[count] = p;
+            count++;
+            segment_start = p + 1;
+        }
+        p++;
+    }
+
+    if (depth_paren != 0 || depth_vec != 0) return -1;
+    if (count != expected_count - 1) return -1;
+
+    arg_starts[count] = segment_start;
+    arg_ends[count] = args_end;
+    count++;
+
+    *arg0 = copy_trimmed_slice(arg_starts[0], arg_ends[0]);
+    *arg1 = copy_trimmed_slice(arg_starts[1], arg_ends[1]);
+    *arg2 = (expected_count == 3) ? copy_trimmed_slice(arg_starts[2], arg_ends[2]) : 0;
+
+    if (!*arg0 || !*arg1 || (expected_count == 3 && !*arg2)) {
+        free_calculus_args(arg0, arg1, arg2);
+        return -1;
+    }
+    if ((*arg0)[0] == '\0' || (*arg1)[0] == '\0' || (expected_count == 3 && (*arg2)[0] == '\0')) {
+        free_calculus_args(arg0, arg1, arg2);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int parse_calculus_call(const char *expression, int *is_derivative, char **arg0, char **arg1, char **arg2) {
+    const char *p;
+    const char *name_end;
+    const char *open_paren;
+    const char *close_paren = 0;
+    const char *args_start;
+    int depth = 0;
+    int expected_count;
+    const char *derivative_name = "derivative";
+    const char *integral_name = "integral";
+
+    if (!expression || !is_derivative || !arg0 || !arg1 || !arg2) return 0;
+
+    *arg0 = 0;
+    *arg1 = 0;
+    *arg2 = 0;
+
+    p = expression;
+    while (isspace((unsigned char)*p)) p++;
+
+    if (strncmp(p, derivative_name, strlen(derivative_name)) == 0) {
+        *is_derivative = 1;
+        name_end = p + (int)strlen(derivative_name);
+    } else if (strncmp(p, integral_name, strlen(integral_name)) == 0) {
+        *is_derivative = 0;
+        name_end = p + (int)strlen(integral_name);
+    } else {
+        return 0;
+    }
+
+    if (isalpha((unsigned char)*name_end) || isdigit((unsigned char)*name_end) || *name_end == '_') {
+        return 0;
+    }
+
+    while (isspace((unsigned char)*name_end)) name_end++;
+    if (*name_end != '(') return -1;
+    open_paren = name_end;
+
+    p = open_paren;
+    while (*p) {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+            if (depth == 0) {
+                close_paren = p;
+                break;
+            }
+            if (depth < 0) return -1;
+        }
+        p++;
+    }
+    if (!close_paren || depth != 0) return -1;
+
+    p = close_paren + 1;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != '\0') return -1;
+
+    args_start = open_paren + 1;
+    expected_count = *is_derivative ? 2 : 3;
+    if (split_calculus_args(args_start, close_paren, expected_count, arg0, arg1, arg2) != 0) {
+        return -1;
+    }
+    return 1;
+}
+
+static int evaluate_calculus_call(const char *expression, const te_binding *bindings, int bind_count, te_value *result, int *error) {
+    int is_derivative = 0;
+    char *expr_arg = 0;
+    char *arg1 = 0;
+    char *arg2 = 0;
+    int parse_status;
+    double at_or_lower;
+    double upper = 0.0;
+    te_binding x_binding;
+    te_binding *merged_bindings = 0;
+    int merged_count = 1;
+    int i;
+    te_expr *compiled_expr = 0;
+    double answer;
+    int local_error = 0;
+
+    parse_status = parse_calculus_call(expression, &is_derivative, &expr_arg, &arg1, &arg2);
+    if (parse_status == 0) return 0;
+    if (parse_status < 0) {
+        if (error) *error = 1;
+        free_calculus_args(&expr_arg, &arg1, &arg2);
+        *result = make_error();
+        return 1;
+    }
+
+    if (evaluate_scalar_text(arg1, bindings, bind_count, &at_or_lower, &local_error) != 0) {
+        if (error) *error = local_error ? local_error : 1;
+        free_calculus_args(&expr_arg, &arg1, &arg2);
+        *result = make_error();
+        return 1;
+    }
+    if (!is_derivative) {
+        if (evaluate_scalar_text(arg2, bindings, bind_count, &upper, &local_error) != 0) {
+            if (error) *error = local_error ? local_error : 1;
+            free_calculus_args(&expr_arg, &arg1, &arg2);
+            *result = make_error();
+            return 1;
+        }
+    }
+
+    if (bindings && bind_count > 0) {
+        for (i = 0; i < bind_count; ++i) {
+            if (bindings[i].name && strcmp(bindings[i].name, "x") != 0) {
+                merged_count++;
+            }
+        }
+    }
+
+    merged_bindings = (te_binding*)malloc((size_t)merged_count * sizeof(te_binding));
+    if (!merged_bindings) {
+        if (error) *error = 1;
+        free_calculus_args(&expr_arg, &arg1, &arg2);
+        *result = make_error();
+        return 1;
+    }
+
+    x_binding.name = "x";
+    x_binding.value = make_scalar(0.0);
+    merged_bindings[0] = x_binding;
+
+    if (bindings && bind_count > 0) {
+        int next = 1;
+        for (i = 0; i < bind_count; ++i) {
+            if (!bindings[i].name || strcmp(bindings[i].name, "x") == 0) continue;
+            merged_bindings[next++] = bindings[i];
+        }
+    }
+
+    compiled_expr = te_compile_value(expr_arg, merged_bindings, merged_count, &local_error);
+    if (!compiled_expr) {
+        if (error) *error = local_error ? local_error : 1;
+        free(merged_bindings);
+        free_calculus_args(&expr_arg, &arg1, &arg2);
+        *result = make_error();
+        return 1;
+    }
+
+    if (is_derivative) {
+        answer = derivative_eval(compiled_expr, &merged_bindings[0], &local_error, at_or_lower);
+    } else {
+        answer = integral_eval(compiled_expr, &merged_bindings[0], &local_error, at_or_lower, upper);
+    }
+
+    te_free(compiled_expr);
+    free(merged_bindings);
+    free_calculus_args(&expr_arg, &arg1, &arg2);
+
+    if (local_error != 0) {
+        if (error) *error = local_error;
+        *result = make_error();
+        return 1;
+    }
+
+    if (error) *error = 0;
+    *result = make_scalar(answer);
+    return 1;
+}
+
+static char *expand_calculus_calls(const char *expression, const te_binding *bindings, int bind_count, int *error) {
+    const char *p = expression;
+    char *out = 0;
+    size_t out_len = 0;
+    size_t out_cap = 0;
+    const char *derivative_name = "derivative";
+    const char *integral_name = "integral";
+
+    while (*p) {
+        int matched = 0;
+        const char *name = 0;
+        size_t name_len = 0;
+
+        if (strncmp(p, derivative_name, strlen(derivative_name)) == 0) {
+            matched = 1;
+            name = derivative_name;
+            name_len = strlen(derivative_name);
+        } else if (strncmp(p, integral_name, strlen(integral_name)) == 0) {
+            matched = 1;
+            name = integral_name;
+            name_len = strlen(integral_name);
+        }
+
+        if (matched) {
+            const char *q = p + name_len;
+            const char *call_end = 0;
+            int depth = 0;
+            te_value value = make_error();
+            int local_error = 0;
+            char *call_text;
+            char number_buf[64];
+            int number_len;
+
+            if (p > expression) {
+                char prev = *(p - 1);
+                if (isalpha((unsigned char)prev) || isdigit((unsigned char)prev) || prev == '_') {
+                    matched = 0;
+                }
+            }
+            if (matched) {
+                while (isspace((unsigned char)*q)) q++;
+                if (*q != '(') matched = 0;
+            }
+
+            if (matched) {
+                const char *r = q;
+                while (*r) {
+                    if (*r == '(') {
+                        depth++;
+                    } else if (*r == ')') {
+                        depth--;
+                        if (depth == 0) {
+                            call_end = r + 1;
+                            break;
+                        }
+                        if (depth < 0) break;
+                    }
+                    r++;
+                }
+                if (!call_end || depth != 0) {
+                    if (error) *error = 1;
+                    free(out);
+                    return 0;
+                }
+            }
+
+            if (matched) {
+                if (isalpha((unsigned char)*call_end) || isdigit((unsigned char)*call_end) || *call_end == '_') {
+                    matched = 0;
+                }
+            }
+
+            if (matched) {
+                call_text = copy_trimmed_slice(p, call_end);
+                if (!call_text) {
+                    if (error) *error = 1;
+                    free(out);
+                    return 0;
+                }
+
+                if (!evaluate_calculus_call(call_text, bindings, bind_count, &value, &local_error) || value.kind != TE_VAL_SCALAR) {
+                    free(call_text);
+                    if (error) *error = local_error ? local_error : 1;
+                    free(out);
+                    return 0;
+                }
+                free(call_text);
+
+                number_len = snprintf(number_buf, sizeof(number_buf), "%.17g", value.scalar);
+                if (number_len < 0) {
+                    if (error) *error = 1;
+                    free(out);
+                    return 0;
+                }
+
+                if (out_len + (size_t)number_len + 1 > out_cap) {
+                    size_t new_cap = out_cap ? out_cap : 64;
+                    while (out_len + (size_t)number_len + 1 > new_cap) new_cap *= 2;
+                    {
+                        char *grown = (char*)realloc(out, new_cap);
+                        if (!grown) {
+                            if (error) *error = 1;
+                            free(out);
+                            return 0;
+                        }
+                        out = grown;
+                        out_cap = new_cap;
+                    }
+                }
+
+                memcpy(out + out_len, number_buf, (size_t)number_len);
+                out_len += (size_t)number_len;
+                out[out_len] = '\0';
+                p = call_end;
+                continue;
+            }
+        }
+
+        if (out_len + 2 > out_cap) {
+            size_t new_cap = out_cap ? out_cap * 2 : 64;
+            char *grown = (char*)realloc(out, new_cap);
+            if (!grown) {
+                if (error) *error = 1;
+                free(out);
+                return 0;
+            }
+            out = grown;
+            out_cap = new_cap;
+        }
+        out[out_len++] = *p++;
+        out[out_len] = '\0';
+    }
+
+    if (!out) {
+        out = (char*)malloc(strlen(expression) + 1);
+        if (!out) {
+            if (error) *error = 1;
+            return 0;
+        }
+        strcpy(out, expression);
+    }
+    if (error) *error = 0;
+    return out;
+}
 
 static te_expr *base(state *s) {
     /* <base> = <constant> | <variable> | <vector-literal> | ... */
@@ -1155,6 +1651,8 @@ te_value te_interp_value(const char *expression, const te_binding *bindings, int
     te_expr* n = 0;
     int store_expr = 0;
     char variable;
+    const char *actual_expression = expression;
+    char *expanded_expression = 0;
 
     if (strncmp(expression, "STORE", 5) == 0) {
         store_expr = 1;
@@ -1174,10 +1672,25 @@ te_value te_interp_value(const char *expression, const te_binding *bindings, int
         }
         
         variable = expression[6];
-        n = te_compile_value(expression + 9, bindings, bind_count, error); /* STORE(A):... */
-    } else {
-        n = te_compile_value(expression, bindings, bind_count, error);
+        actual_expression = expression + 9; /* STORE(A):... */
     }
+
+    expanded_expression = expand_calculus_calls(actual_expression, bindings, bind_count, error);
+    if (!expanded_expression) {
+        return make_error();
+    }
+
+    actual_expression = expanded_expression;
+
+    if (evaluate_calculus_call(actual_expression, bindings, bind_count, &ret, error)) {
+        if (store_expr && ret.kind != TE_VAL_ERROR) {
+            set_var(variable, ret);
+        }
+        free(expanded_expression);
+        return ret;
+    }
+
+    n = te_compile_value(actual_expression, bindings, bind_count, error);
 
     if (n) {
         ret = te_eval_value(n);
@@ -1186,7 +1699,7 @@ te_value te_interp_value(const char *expression, const te_binding *bindings, int
         }
         te_free(n);
     }
-
+    free(expanded_expression);
     return ret;
 }
 
