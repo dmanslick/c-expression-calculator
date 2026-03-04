@@ -1306,8 +1306,18 @@ te_value te_eval_value(const te_expr *n) {
             }
 
             if (n->function == negate) {
-                if (ARITY(n->type) != 1 || args[0].kind != TE_VAL_SCALAR) return make_error();
-                return make_scalar(-args[0].scalar);
+                if (ARITY(n->type) != 1) return make_error();
+                if (args[0].kind == TE_VAL_SCALAR) {
+                    return make_scalar(-args[0].scalar);
+                }
+                if (args[0].kind == TE_VAL_VEC3) {
+                    return make_vec3(
+                        -args[0].vec3.x,
+                        -args[0].vec3.y,
+                        -args[0].vec3.z
+                    );
+                }
+                return make_error();
             }
 
             if (n->function == magnitude) {
